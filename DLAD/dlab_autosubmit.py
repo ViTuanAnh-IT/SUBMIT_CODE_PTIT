@@ -25,7 +25,7 @@ import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ============================ CẤU HÌNH ============================
-REPO = "ManhNTzz/DSA_CODEPTIT"
+REPO = "Link repo của nhưng bài cần submit"
 BRANCH = "main"                 # đổi thành master nếu cần
 DLAB_URL = "https://dlab.ptit.edu.vn"   # <-- SỬA thành URL thật của DLab
 LANGUAGE_LABEL = "C/C++"
