@@ -5,7 +5,7 @@ Tool tự động nộp bài trên DLab (PTIT) bằng Python + Playwright. Tool 
 ## Cách hoạt động
 
 1. Đọc cây thư mục repo GitHub qua API, tìm file có chứa mã bài (ví dụ `DSA02035`).
-2. Mở DLab bằng profile trình duyệt đã đăng nhập sẵn.
+2. Mở DLab bằng profile trình duyệt đã đăng nhập sẵn.(lần đầu phải đăng nhập để có cookie cho những lần sau)
 3. Quét bảng bài tập của lớp (qua tất cả các trang), lọc ra bài chưa xanh.
 4. Với mỗi bài có code trong repo: tải file về, mở trang làm bài, upload file, chọn C/C++, bấm **Nộp bài**.
 5. Đọc kết quả ở bảng "Lịch sử nộp của tôi" và in ra terminal.
