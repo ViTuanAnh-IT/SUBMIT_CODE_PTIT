@@ -106,7 +106,8 @@ def github_tree():
 
 def find_file(paths, code):
     code_l = code.lower()
-    hits = [p for p in paths if code_l in p.lower() and p.lower().endswith(CODE_EXT)]
+    pat = re.compile(r"(?<![a-z0-9])" + re.escape(code_l) + r"(?![a-z0-9])", re.I)
+    hits = [p for p in paths if p.lower().endswith(CODE_EXT) and pat.search(p)]
     hits.sort(key=lambda p: (not Path(p).name.lower().startswith(code_l), len(p)))
     return hits[0] if hits else None
 
@@ -142,6 +143,32 @@ def goto_courses(page):
     page.locator("tr.ant-table-row").first.wait_for(timeout=30000)
 
 
+def get_class_label(page):
+    """Đọc tên lớp đang chọn ở ô dropdown 'Lớp học của tôi'."""
+    pat = re.compile(r"INT\s*_?\d+", re.I)
+    candidates = [
+        page.locator(".ant-select").filter(has_text=pat),
+        page.locator(".ant-select-selection-item").filter(has_text=pat),
+        page.locator(".ant-select-selection-placeholder").filter(has_text=pat),
+    ]
+    for loc in candidates:
+        try:
+            if loc.count():
+                txt = loc.first.inner_text().strip()
+                if txt:
+                    return txt
+        except Exception:
+            continue
+    return ""
+
+
+def class_slug(label):
+    m = re.search(r"INT\s*_?\d+", label, re.I)
+    if m:
+        return re.sub(r"\W+", "", m.group(0)).upper()
+    return re.sub(r"\W+", "_", label)[:30] or "default"
+
+
 def read_rows(page):
     return page.evaluate(JS_ROWS)
 
@@ -150,7 +177,7 @@ def go_to_page(page, n):
     """Chuyển tới trang n của bảng và chờ nội dung đổi. Trả về True nếu thành công."""
     li = page.locator(f"li.ant-pagination-item-{n}")
     if li.count() == 0:
-        return False
+        return n == 1                    # lớp ít bài: không có phân trang, chỉ có trang 1
     cls = li.first.get_attribute("class") or ""
     if "ant-pagination-item-active" in cls:
         return True                      # đang ở đúng trang rồi
@@ -168,7 +195,9 @@ def go_to_page(page, n):
 
 def collect_pending(page):
     """Quét toàn bộ các trang, trả về (pending, solved, attempted)."""
-    goto_courses(page)
+    if "/courses" not in page.url:
+        goto_courses(page)
+    page.locator("tr.ant-table-row").first.wait_for(timeout=30000)
     total = page.evaluate(JS_TOTAL_PAGES)
     print(f"    Bảng có {total} trang")
 
@@ -202,6 +231,11 @@ def open_problem(page, code):
     page.goto(SUBMIT_URL.format(code=code))
     page.wait_for_load_state("networkidle")
     page.locator("input[type=file]").first.wait_for(state="attached", timeout=20000)
+    try:
+        head = page.get_by_text(re.compile(r"Làm bài lớp")).first.inner_text().strip()
+        print(f"  [i] {head}")
+    except Exception:
+        pass
 
 
 def first_history_row(page):
@@ -235,6 +269,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("codes", nargs="*", help="(tuỳ chọn) mã bài chỉ định thủ công")
     ap.add_argument("--repo", default="", help="link repo GitHub (ghi đè REPO_URL)")
+    ap.add_argument("--class", dest="class_name", default="",
+                    help="mã lớp bắt buộc phải đang chọn, ví dụ INT1359 (an toàn: sai lớp thì dừng)")
     ap.add_argument("--dry-run", action="store_true", help="chỉ liệt kê, không nộp")
     ap.add_argument("--limit", type=int, default=0, help="số bài tối đa sẽ nộp")
     ap.add_argument("--prefix", default="", help="chỉ lấy bài có mã bắt đầu bằng chuỗi này")
@@ -244,7 +280,7 @@ def main():
                     help="nộp lại cả bài tool từng nộp nhưng chưa AC")
     args = ap.parse_args()
 
-    global REPO, BRANCH
+    global REPO, BRANCH, STATE_FILE
     REPO, link_branch = parse_repo(args.repo or REPO_URL)
     if link_branch:
         BRANCH = link_branch
@@ -257,7 +293,15 @@ def main():
         ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), headless=False)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(COURSES_URL)
-        input("Đăng nhập nếu cần và chọn đúng lớp (06 - INT1306), rồi bấm Enter ở đây... ")
+        input("Đăng nhập nếu cần và CHỌN ĐÚNG LỚP muốn nộp ở ô 'Lớp học của tôi', rồi bấm Enter ở đây... ")
+
+        label = get_class_label(page)
+        print(f"[*] Lớp đang chọn: {label or '(không đọc được)'}")
+        if args.class_name and args.class_name.lower() not in label.lower():
+            ctx.close()
+            sys.exit(f"[!] Lớp đang chọn không chứa '{args.class_name}'. Dừng để tránh nộp nhầm lớp.")
+        STATE_FILE = Path(f"./state_{class_slug(label)}.json")
+        print(f"[*] File trạng thái: {STATE_FILE}")
 
         if args.codes:
             codes = [c.strip().upper() for c in args.codes]
