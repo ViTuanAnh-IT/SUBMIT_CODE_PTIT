@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-DLab (code.ptit.edu.vn) auto-submit tool - chế độ TỰ ĐỘNG.
+DLab (code.ptit.edu.vn) auto-submit tool - chế độ TỰ ĐỘNG (bản tối ưu tốc độ).
 
 Cài đặt:
     pip install playwright requests
@@ -9,11 +9,17 @@ Cài đặt:
 Dùng:
     python dlab_autosubmit.py --dry-run          # chỉ liệt kê, KHÔNG nộp
     python dlab_autosubmit.py --limit 3          # nộp thử tối đa 3 bài
-    python dlab_autosubmit.py                    # nộp tất cả bài chưa AC
+    python dlab_autosubmit.py                    # nộp tất cả bài chưa AC (chế độ nhanh)
+    python dlab_autosubmit.py --wait-each        # chờ chấm xong từng bài (chậm hơn, thấy kết quả ngay)
+    python dlab_autosubmit.py --delay 1          # nghỉ 1 giây giữa các bài
+    python dlab_autosubmit.py --class INT1359    # dừng nếu lớp đang chọn không phải INT1359
     python dlab_autosubmit.py --skip-attempted   # bỏ qua bài đã làm sai (dấu ✘)
     python dlab_autosubmit.py --prefix DSA02     # chỉ các bài có mã bắt đầu bằng DSA02
     python dlab_autosubmit.py --repo <link repo> # ghi đè REPO_URL
     python dlab_autosubmit.py DSA02035           # chỉ định bài thủ công
+
+Chế độ nhanh (mặc định): nộp liên tiếp, không đứng chờ chấm từng bài. Server chấm song song
+trong lúc tool nộp bài kế tiếp; cuối cùng tool quét lại bảng bài tập để biết bài nào đã AC.
 
 Lần đầu: tự đăng nhập, chọn đúng lớp, rồi bấm Enter ở terminal.
 """
@@ -22,14 +28,15 @@ import json
 import re
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.parse import quote, urlparse
+from urllib.parse import quote
 
 import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ============================ CẤU HÌNH ============================
-REPO_URL = ""   # dán thẳng link repo (hoặc dùng --repo)
+REPO_URL = "https://github.com/TuNguyen0304/full-codeptit/tree/main/dsa-cpp"   # dán thẳng link repo (hoặc dùng --repo) //ở đây tôi đang gắn sẵn link repo của DSA
 BRANCH = ""                     # để trống = tự lấy nhánh mặc định của repo
 REPO = ""                       # tự tách ra từ REPO_URL, không cần sửa
 
@@ -38,11 +45,14 @@ SUBMIT_URL = "https://code.ptit.edu.vn/submit/{code}"     # trang làm bài củ
 
 LANGUAGE_LABEL = "C/C++"
 CODE_EXT = (".cpp", ".c", ".py", ".java")
-DELAY_BETWEEN = 5               # giây nghỉ giữa các lần nộp
-WAIT_RESULT = 40                # giây tối đa chờ chấm bài
+DELAY_BETWEEN = 2               # giây nghỉ giữa các lần nộp (đừng đặt quá thấp)
+WAIT_RESULT = 40                # giây tối đa chờ chấm bài (chỉ dùng với --wait-each)
+GRADE_WAITS = (5, 8, 12)        # chế độ nhanh: các lần chờ rồi kiểm tra lại bảng (giây)
+BLOCK_ASSETS = False            # True = chặn ảnh/font/video (có thể làm trang DLab bị trắng/treo; dùng --block-assets để thử)
+DOWNLOAD_WORKERS = 8            # số luồng tải code song song từ GitHub
 PROFILE_DIR = Path("./profile")
 CACHE_DIR = Path("./downloaded")
-STATE_FILE = Path("./state.json")   # ghi nhớ bài đã nộp / đã AC giữa các lần chạy
+STATE_FILE = Path("./state.json")   # tự đổi thành state_<MÃ LỚP>.json theo lớp đang chọn
 AC_PATTERN = re.compile(r"\bAC\b|accept|đúng|đạt|100\s*/\s*100", re.I)
 # ==================================================================
 
@@ -136,10 +146,13 @@ def save_state(state):
     STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def now():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
 # ---------------------------- DLab: quét bảng ----------------------------
 def goto_courses(page):
-    page.goto(COURSES_URL)
-    page.wait_for_load_state("networkidle")
+    page.goto(COURSES_URL, wait_until="domcontentloaded")
     page.locator("tr.ant-table-row").first.wait_for(timeout=30000)
 
 
@@ -184,22 +197,22 @@ def go_to_page(page, n):
     before = read_rows(page)
     first_before = before[0]["code"] if before else None
     li.first.click()
-    for _ in range(40):                  # tối đa ~12 giây
-        page.wait_for_timeout(300)
+    for _ in range(80):                  # tối đa ~12 giây
+        page.wait_for_timeout(150)
         cur = read_rows(page)
         if cur and cur[0]["code"] != first_before:
-            page.wait_for_timeout(300)
             return True
     return False
 
 
-def collect_pending(page):
+def collect_pending(page, quiet=False):
     """Quét toàn bộ các trang, trả về (pending, solved, attempted)."""
     if "/courses" not in page.url:
         goto_courses(page)
     page.locator("tr.ant-table-row").first.wait_for(timeout=30000)
     total = page.evaluate(JS_TOTAL_PAGES)
-    print(f"    Bảng có {total} trang")
+    if not quiet:
+        print(f"    Bảng có {total} trang")
 
     pending, solved, attempted, seen = [], [], set(), set()
     for n in range(1, total + 1):
@@ -221,18 +234,21 @@ def collect_pending(page):
                     attempted.add(code); a += 1
                 else:
                     u += 1
-        print(f"    Trang {n}: {len(rows)} dòng | AC {s} | làm sai {a} | chưa làm {u}"
-              f" | {rows[0]['code']} -> {rows[-1]['code']}" if rows else f"    Trang {n}: 0 dòng")
+        if not quiet:
+            if rows:
+                print(f"    Trang {n}: {len(rows)} dòng | AC {s} | làm sai {a} | chưa làm {u}"
+                      f" | {rows[0]['code']} -> {rows[-1]['code']}")
+            else:
+                print(f"    Trang {n}: 0 dòng")
     return pending, solved, attempted
 
 
 # ---------------------------- DLab: nộp bài ----------------------------
 def open_problem(page, code):
-    page.goto(SUBMIT_URL.format(code=code))
-    page.wait_for_load_state("networkidle")
+    page.goto(SUBMIT_URL.format(code=code), wait_until="domcontentloaded")
     page.locator("input[type=file]").first.wait_for(state="attached", timeout=20000)
     try:
-        head = page.get_by_text(re.compile(r"Làm bài lớp")).first.inner_text().strip()
+        head = page.get_by_text(re.compile(r"Làm bài lớp")).first.inner_text(timeout=1500).strip()
         print(f"  [i] {head}")
     except Exception:
         pass
@@ -243,19 +259,29 @@ def first_history_row(page):
     return row.inner_text().strip() if row.count() else ""
 
 
-def submit(page, file_path):
+def submit(page, file_path, wait_result):
+    """Nộp bài. wait_result=False: chỉ chờ dòng lịch sử mới xuất hiện rồi đi tiếp."""
     before = first_history_row(page)      # dòng lịch sử hiện tại, để nhận ra dòng mới
     page.locator("input[type=file]").first.set_input_files(str(file_path))
     try:
-        page.locator("select").last.select_option(label=LANGUAGE_LABEL)
+        page.locator("select").last.select_option(label=LANGUAGE_LABEL, timeout=1500)
     except Exception:
         pass
     page.get_by_role("button", name=re.compile("Nộp bài")).click()
 
+    if not wait_result:
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            page.wait_for_timeout(400)
+            txt = first_history_row(page)
+            if txt and txt != before:
+                return "đã nộp, chờ chấm"
+        return "đã bấm nộp (chưa thấy dòng lịch sử mới)"
+
     deadline = time.time() + WAIT_RESULT
     result = "?"
     while time.time() < deadline:
-        page.wait_for_timeout(2000)
+        page.wait_for_timeout(1000)
         txt = first_history_row(page)
         if txt and txt != before and \
                 not re.search(r"(đang|pending|queue|chờ|running)", txt, re.I):
@@ -264,13 +290,47 @@ def submit(page, file_path):
     return result
 
 
+def verify_submitted(page, submitted, label, state):
+    """Chế độ nhanh: quét lại bảng bài tập để biết bài nào đã AC."""
+    remaining = set(submitted)
+    for wait in GRADE_WAITS:
+        print(f"[*] Chờ {wait}s cho hệ thống chấm rồi kiểm tra lại bảng...")
+        time.sleep(wait)
+        try:
+            goto_courses(page)
+            now_label = get_class_label(page)
+            if label and now_label and now_label != label:
+                print(f"[!] Sau khi tải lại, lớp đang hiển thị là '{now_label}' (khác '{label}'). "
+                      "Bỏ qua bước xác nhận, hãy kiểm tra trên DLab.")
+                return
+            _, solved, _ = collect_pending(page, quiet=True)
+        except Exception as e:
+            print(f"[!] Không quét lại được bảng: {e}")
+            return
+        solved = set(solved)
+        for c in list(remaining):
+            if c in solved:
+                state[c] = {"ac": True, "result": "AC (xác nhận từ bảng bài tập)", "time": now()}
+                remaining.discard(c)
+        save_state(state)
+        if not remaining:
+            break
+    for c in remaining:
+        state[c] = {"ac": False, "result": "chưa thấy AC sau khi chấm", "time": now()}
+    save_state(state)
+    ok = len(submitted) - len(remaining)
+    print(f"\n[*] Xác nhận: AC {ok}/{len(submitted)} bài vừa nộp")
+    if remaining:
+        print("    Chưa AC:", ", ".join(sorted(remaining)))
+
+
 # ---------------------------- main ----------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("codes", nargs="*", help="(tuỳ chọn) mã bài chỉ định thủ công")
     ap.add_argument("--repo", default="", help="link repo GitHub (ghi đè REPO_URL)")
     ap.add_argument("--class", dest="class_name", default="",
-                    help="mã lớp bắt buộc phải đang chọn, ví dụ INT1359 (an toàn: sai lớp thì dừng)")
+                    help="mã lớp bắt buộc phải đang chọn, ví dụ INT1359 (sai lớp thì dừng)")
     ap.add_argument("--dry-run", action="store_true", help="chỉ liệt kê, không nộp")
     ap.add_argument("--limit", type=int, default=0, help="số bài tối đa sẽ nộp")
     ap.add_argument("--prefix", default="", help="chỉ lấy bài có mã bắt đầu bằng chuỗi này")
@@ -278,6 +338,12 @@ def main():
                     help="bỏ qua bài đã làm sai (dấu ✘) trên DLab")
     ap.add_argument("--retry-failed", action="store_true",
                     help="nộp lại cả bài tool từng nộp nhưng chưa AC")
+    ap.add_argument("--wait-each", action="store_true",
+                    help="chờ chấm xong từng bài rồi mới nộp bài kế (chậm hơn)")
+    ap.add_argument("--block-assets", action="store_true",
+                    help="thử chặn ảnh/font/video cho nhanh (nếu trang bị trắng thì đừng dùng)")
+    ap.add_argument("--delay", type=float, default=DELAY_BETWEEN,
+                    help=f"giây nghỉ giữa các lần nộp (mặc định {DELAY_BETWEEN})")
     args = ap.parse_args()
 
     global REPO, BRANCH, STATE_FILE
@@ -291,8 +357,12 @@ def main():
 
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), headless=False)
+        if BLOCK_ASSETS or args.block_assets:
+            ctx.route("**/*", lambda route: route.abort()
+                      if route.request.resource_type in ("image", "media", "font")
+                      else route.continue_())
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto(COURSES_URL)
+        page.goto(COURSES_URL, wait_until="domcontentloaded")
         input("Đăng nhập nếu cần và CHỌN ĐÚNG LỚP muốn nộp ở ô 'Lớp học của tôi', rồi bấm Enter ở đây... ")
 
         label = get_class_label(page)
@@ -318,12 +388,14 @@ def main():
         if args.prefix:
             codes = [c for c in codes if c.startswith(args.prefix.upper())]
 
-        # bỏ qua bài tool đã nộp ở các lần chạy trước (state.json)
+        # bỏ qua bài đã AC / đã thử mà chưa AC trong các lần chạy trước (state)
         state = load_state()
-        skipped = [c for c in codes if c in state and (state[c].get("ac") or not args.retry_failed)]
+        skipped = [c for c in codes if c in state and
+                   (state[c].get("ac") is True or
+                    (state[c].get("ac") is False and not args.retry_failed))]
         codes = [c for c in codes if c not in skipped]
         if skipped:
-            print(f"[*] Bỏ qua {len(skipped)} bài tool đã nộp trước đó (state.json)")
+            print(f"[*] Bỏ qua {len(skipped)} bài tool đã nộp trước đó ({STATE_FILE.name})")
 
         # chỉ giữ bài có trong repo
         todo, missing = [], []
@@ -345,24 +417,47 @@ def main():
                 print(f"    - {c}  ->  {path}")
             ctx.close()
             return
+        if not todo:
+            print("[*] Không có bài nào cần nộp.")
+            ctx.close()
+            return
 
+        mode = "chờ chấm từng bài" if args.wait_each else "nhanh (nộp liên tiếp, xác nhận ở cuối)"
+        print(f"[*] Chế độ: {mode} | nghỉ {args.delay}s giữa các bài")
+
+        # tải code song song ở nền, trong lúc trình duyệt đang nộp bài
+        executor = ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS)
+        futures = {c: executor.submit(download, path) for c, path in todo}
+
+        submitted = []
         for i, (code, path) in enumerate(todo, 1):
             print(f"\n=== [{i}/{len(todo)}] {code} ===")
             print(f"  [+] {path}")
             try:
-                local = download(path)
+                local = futures[code].result()
                 open_problem(page, code)
-                res = submit(page, local)
-                ac = bool(AC_PATTERN.search(res))
-                print(f"  [=] Kết quả: {res}  ->  {'AC' if ac else 'CHƯA AC'}")
-                state[code] = {"ac": ac, "result": res, "time": time.strftime("%Y-%m-%d %H:%M:%S")}
+                res = submit(page, local, args.wait_each)
+                if args.wait_each:
+                    ac = bool(AC_PATTERN.search(res))
+                    print(f"  [=] Kết quả: {res}  ->  {'AC' if ac else 'CHƯA AC'}")
+                    state[code] = {"ac": ac, "result": res, "time": now()}
+                else:
+                    print(f"  [=] {res}")
+                    state[code] = {"ac": None, "result": res, "time": now()}
+                    submitted.append(code)
                 save_state(state)
             except PWTimeout as e:
                 page.screenshot(path="debug.png", full_page=True)
                 print(f"  [!] Timeout (đã lưu debug.png): {e}")
             except Exception as e:
                 print(f"  [!] Lỗi: {e}")
-            time.sleep(DELAY_BETWEEN)
+            if i < len(todo):
+                time.sleep(args.delay)
+
+        executor.shutdown(wait=False)
+
+        if submitted:
+            verify_submitted(page, submitted, label, state)
 
         ctx.close()
 
