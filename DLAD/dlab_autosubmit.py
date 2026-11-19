@@ -28,6 +28,7 @@ import json
 import re
 import sys
 import time
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import quote
@@ -36,7 +37,7 @@ import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 
 # ============================ CẤU HÌNH ============================
-REPO_URL = "https://github.com/TuNguyen0304/full-codeptit/tree/main/dsa-cpp"   # dán thẳng link repo (hoặc dùng --repo) //ở đây tôi đang gắn sẵn link repo của DSA
+REPO_URL = "https://github.com/ManhNTzz/DSA_CODEPTIT"   # dán thẳng link repo (hoặc dùng --repo)
 BRANCH = ""                     # để trống = tự lấy nhánh mặc định của repo
 REPO = ""                       # tự tách ra từ REPO_URL, không cần sửa
 
@@ -50,8 +51,12 @@ WAIT_RESULT = 40                # giây tối đa chờ chấm bài (chỉ dùng
 GRADE_WAITS = (5, 8, 12)        # chế độ nhanh: các lần chờ rồi kiểm tra lại bảng (giây)
 BLOCK_ASSETS = False            # True = chặn ảnh/font/video (có thể làm trang DLab bị trắng/treo; dùng --block-assets để thử)
 DOWNLOAD_WORKERS = 8            # số luồng tải code song song từ GitHub
+DAILY_LIMITS = {"INT1306": 30, "INT1359": 10}   # hạn mức nộp bài mỗi ngày của từng lớp (0/không có = không giới hạn)
+QUOTA_PATTERN = re.compile(r"giới hạn|vượt quá|quá số lần|hết lượt|too many|limit|exceed", re.I)
 PROFILE_DIR = Path("./profile")
 CACHE_DIR = Path("./downloaded")
+REPO_CACHE_DIR = Path("./repo_cache")   # nơi lưu file zip của repo
+REPO_CACHE_HOURS = 6                    # zip cũ hơn số giờ này sẽ được tải lại (hoặc dùng --refresh-repo)
 STATE_FILE = Path("./state.json")   # tự đổi thành state_<MÃ LỚP>.json theo lớp đang chọn
 AC_PATTERN = re.compile(r"\bAC\b|accept|đúng|đạt|100\s*/\s*100", re.I)
 # ==================================================================
@@ -101,17 +106,44 @@ def parse_repo(link):
     return f"{owner}/{name}", branch
 
 
-def github_tree():
-    global BRANCH
-    if not BRANCH:
-        info = requests.get(f"https://api.github.com/repos/{REPO}", timeout=30)
-        info.raise_for_status()
-        BRANCH = info.json()["default_branch"]
-        print(f"[*] Nhánh mặc định: {BRANCH}")
-    url = f"https://api.github.com/repos/{REPO}/git/trees/{BRANCH}?recursive=1"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    return [t["path"] for t in r.json()["tree"] if t["type"] == "blob"]
+REPO_ZIP = None
+ZIP_MEMBERS = {}
+
+
+def github_tree(refresh=False):
+    """Tải repo dạng zip (không dùng API nên không bị rate limit), trả về danh sách đường dẫn file."""
+    global REPO_ZIP, ZIP_MEMBERS
+    REPO_CACHE_DIR.mkdir(exist_ok=True)
+    tag = re.sub(r"[^\w.-]", "_", REPO + (f"@{BRANCH}" if BRANCH else ""))
+    REPO_ZIP = REPO_CACHE_DIR / f"{tag}.zip"
+    fresh = REPO_ZIP.exists() and (time.time() - REPO_ZIP.stat().st_mtime) < REPO_CACHE_HOURS * 3600
+
+    if refresh or not fresh:
+        ref = f"refs/heads/{BRANCH}" if BRANCH else "HEAD"
+        url = f"https://github.com/{REPO}/archive/{ref}.zip"
+        print(f"[*] Đang tải repo dạng zip: {url}")
+        try:
+            r = requests.get(url, timeout=120)
+            r.raise_for_status()
+            REPO_ZIP.write_bytes(r.content)
+        except Exception as e:
+            if REPO_ZIP.exists():
+                print(f"[!] Không tải được bản mới ({e}). Dùng bản zip đã lưu trước đó.")
+            else:
+                sys.exit(f"[!] Không tải được repo: {e}\n    Kiểm tra link repo (phải là public) và kết nối mạng.")
+    else:
+        print(f"[*] Dùng bản repo đã lưu ({REPO_ZIP.name}), dùng --refresh-repo để tải lại")
+
+    ZIP_MEMBERS = {}
+    with zipfile.ZipFile(REPO_ZIP) as z:
+        for name in z.namelist():
+            if name.endswith("/"):
+                continue
+            parts = name.split("/", 1)       # bỏ thư mục gốc dạng "repo-main/"
+            if len(parts) == 2:
+                ZIP_MEMBERS[parts[1]] = name
+    print(f"[*] Repo có {len(ZIP_MEMBERS)} file")
+    return list(ZIP_MEMBERS)
 
 
 def find_file(paths, code):
@@ -123,12 +155,12 @@ def find_file(paths, code):
 
 
 def download(path):
+    """Lấy file code từ zip đã tải (chạy offline, không gọi mạng)."""
     CACHE_DIR.mkdir(exist_ok=True)
-    raw = f"https://raw.githubusercontent.com/{REPO}/{BRANCH}/{quote(path)}"
-    r = requests.get(raw, timeout=30)
-    r.raise_for_status()
+    with zipfile.ZipFile(REPO_ZIP) as z:
+        data = z.read(ZIP_MEMBERS[path])
     out = CACHE_DIR / Path(path).name
-    out.write_bytes(r.content)
+    out.write_bytes(data)
     return out
 
 
@@ -148,6 +180,37 @@ def save_state(state):
 
 def now():
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def today():
+    return time.strftime("%Y-%m-%d")
+
+
+def used_today(state):
+    d = state.get("_daily", {})
+    return d.get("count", 0) if d.get("date") == today() else 0
+
+
+def bump_used(state):
+    state["_daily"] = {"date": today(), "count": used_today(state) + 1}
+
+
+class QuotaExceeded(Exception):
+    pass
+
+
+def check_quota_message(page):
+    """Nếu DLab hiện thông báo hết lượt/giới hạn sau khi bấm nộp thì trả về nội dung."""
+    page.wait_for_timeout(700)
+    try:
+        loc = page.locator(".ant-message-notice, .ant-notification-notice, .ant-modal-body, .ant-alert-error")
+        for i in range(min(loc.count(), 5)):
+            t = loc.nth(i).inner_text(timeout=500)
+            if QUOTA_PATTERN.search(t):
+                return t.strip()
+    except Exception:
+        pass
+    return ""
 
 
 # ---------------------------- DLab: quét bảng ----------------------------
@@ -268,6 +331,9 @@ def submit(page, file_path, wait_result):
     except Exception:
         pass
     page.get_by_role("button", name=re.compile("Nộp bài")).click()
+    msg = check_quota_message(page)
+    if msg:
+        raise QuotaExceeded(msg)
 
     if not wait_result:
         deadline = time.time() + 15
@@ -340,6 +406,12 @@ def main():
                     help="nộp lại cả bài tool từng nộp nhưng chưa AC")
     ap.add_argument("--wait-each", action="store_true",
                     help="chờ chấm xong từng bài rồi mới nộp bài kế (chậm hơn)")
+    ap.add_argument("--daily-limit", type=int, default=None,
+                    help="số lượt nộp tối đa mỗi ngày (ghi đè DAILY_LIMITS, 0 = không giới hạn)")
+    ap.add_argument("--used", type=int, default=None,
+                    help="số lượt hôm nay bạn đã dùng thủ công trên DLab, tool sẽ trừ đi")
+    ap.add_argument("--refresh-repo", action="store_true",
+                    help="tải lại repo từ GitHub dù bản đã lưu còn mới")
     ap.add_argument("--block-assets", action="store_true",
                     help="thử chặn ảnh/font/video cho nhanh (nếu trang bị trắng thì đừng dùng)")
     ap.add_argument("--delay", type=float, default=DELAY_BETWEEN,
@@ -353,7 +425,7 @@ def main():
     print(f"[*] Repo: {REPO}")
 
     print("[*] Đang đọc repo GitHub...")
-    paths = github_tree()
+    paths = github_tree(args.refresh_repo)
 
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(str(PROFILE_DIR), headless=False)
@@ -412,6 +484,24 @@ def main():
         if args.limit:
             todo = todo[:args.limit]
 
+        # --- hạn mức nộp bài mỗi ngày ---
+        slug = class_slug(label)
+        limit = args.daily_limit if args.daily_limit is not None else DAILY_LIMITS.get(slug, 0)
+        if args.used is not None:
+            state["_daily"] = {"date": today(), "count": args.used}
+            save_state(state)
+        used = used_today(state)
+        if limit:
+            remaining = max(limit - used, 0)
+            print(f"[*] Hạn mức hôm nay ({slug}): đã dùng {used}/{limit}, còn {remaining} lượt")
+            if remaining <= 0:
+                print("[*] Đã hết hạn mức hôm nay. Ngày mai chạy lại, tool sẽ tự tiếp tục các bài còn lại.")
+                ctx.close()
+                return
+            if len(todo) > remaining:
+                print(f"    Còn {len(todo) - remaining} bài sẽ để các ngày sau.")
+                todo = todo[:remaining]
+
         if args.dry_run:
             for c, path in todo:
                 print(f"    - {c}  ->  {path}")
@@ -437,6 +527,7 @@ def main():
                 local = futures[code].result()
                 open_problem(page, code)
                 res = submit(page, local, args.wait_each)
+                bump_used(state)
                 if args.wait_each:
                     ac = bool(AC_PATTERN.search(res))
                     print(f"  [=] Kết quả: {res}  ->  {'AC' if ac else 'CHƯA AC'}")
@@ -446,6 +537,10 @@ def main():
                     state[code] = {"ac": None, "result": res, "time": now()}
                     submitted.append(code)
                 save_state(state)
+            except QuotaExceeded as e:
+                print(f"  [!] DLab báo đã hết lượt/giới hạn: {e}")
+                print("      Dừng nộp. Ngày mai chạy lại để tiếp tục.")
+                break
             except PWTimeout as e:
                 page.screenshot(path="debug.png", full_page=True)
                 print(f"  [!] Timeout (đã lưu debug.png): {e}")
